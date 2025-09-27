@@ -30,6 +30,9 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .vision import run_dp_sharded_vision_model
+from ...compilation.backends import set_model_tag
+from ...compilation.decorators import support_torch_compile
+from ...config import VllmConfig
 
 NORM2FN = {
     'rms_norm': RMSNorm,
@@ -39,7 +42,7 @@ NORM2FN = {
 
 class InternVisionEmbeddings(nn.Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self,         vllm_config: VllmConfig ,   prefix: str ,config: PretrainedConfig):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
@@ -63,7 +66,7 @@ class InternVisionEmbeddings(nn.Module):
         target_dtype = pos_embed.dtype
         pos_embed = pos_embed.float().reshape(
             1, self.image_size // self.patch_size,
-            self.image_size // self.patch_size, -1).permute(0, 3, 1, 2)
+               self.image_size // self.patch_size, -1).permute(0, 3, 1, 2)
         pos_embed = F.interpolate(pos_embed,
                                   size=(H, W),
                                   mode='bicubic',
@@ -109,9 +112,9 @@ class InternVisionPatchModel(nn.Module):
         return self.embeddings
 
     def forward(
-        self,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_embeds: Optional[torch.Tensor] = None,
+            self,
+            pixel_values: Optional[torch.Tensor] = None,
+            pixel_embeds: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         if pixel_values is None and pixel_embeds is None:
             raise ValueError(
@@ -133,13 +136,14 @@ class InternParallelAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        *,
-        num_dummy_heads: int = 0,
-        prefix: str = "",
-        use_data_parallel: bool = False,
+            self,
+            vllm_config: VllmConfig ,
+            config: PretrainedConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            *,
+            num_dummy_heads: int = 0,
+            prefix: str = "",
+            use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
@@ -172,7 +176,7 @@ class InternParallelAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv",
             disable_tp=use_data_parallel,
-        )
+            )
 
         self.qk_normalization = config.qk_normalization
 
@@ -216,19 +220,109 @@ class InternParallelAttention(nn.Module):
         if self.qk_normalization:
             q, k = self._apply_qk_norm(q, k)
 
-        out = self.attn(q, k, v)
+        # out = self.attn(q, k, v)
+        num_kv_heads = self.num_heads
+        num_queries_per_kv=  self.num_heads // num_kv_heads
+        out =  torch.ops.internvl.vision_attention(q, k, v,self.num_heads,self.head_dim, num_kv_heads,num_queries_per_kv,self.scale,False)
         out, _ = self.proj(out)
         return out
+
+
+
+@torch.library.custom_op("internvl::vision_attention", mutates_args=())
+def vision_attention( query: torch.Tensor,
+                      key: torch.Tensor,
+                      value: torch.Tensor,
+                      num_heads:int,
+                      head_size:int,
+                      num_kv_heads:int,
+                      num_queries_per_kv:int,
+                      scale:float,
+                      use_upstream_fa:bool,
+                      )-> torch.Tensor:
+    """Input shape:
+    (batch_size x seq_len x hidden_size) or
+    (batch_size x seq_len x num_heads x head_size)
+    """
+    bsz, q_len = query.size()[:2]
+    kv_len = key.size(1)
+
+    query = query.view(bsz, q_len, num_heads, head_size)
+    key = key.view(bsz, kv_len, num_kv_heads, head_size)
+    value = value.view(bsz, kv_len, num_kv_heads, head_size)
+
+    if (num_repeat := num_queries_per_kv) > 1:
+        # Handle MQA and GQA
+        key = torch.repeat_interleave(key, num_repeat, dim=2)
+        value = torch.repeat_interleave(value, num_repeat, dim=2)
+
+
+    cu_seqlens_q = torch.arange(0, (bsz + 1) * q_len,
+                                step=q_len,
+                                dtype=torch.int32,
+                                device=query.device)
+    cu_seqlens_k = torch.arange(0, (bsz + 1) * kv_len,
+                                step=kv_len,
+                                dtype=torch.int32,
+                                device=key.device)
+
+
+    if use_upstream_fa:
+        from flash_attn import flash_attn_varlen_func
+        _flash_attn_varlen_func = flash_attn_varlen_func
+    else:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+        _flash_attn_varlen_func = flash_attn_varlen_func
+
+    out = _flash_attn_varlen_func(
+        query.flatten(0, 1),
+        key.flatten(0, 1),
+        value.flatten(0, 1),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=q_len,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+    )
+
+    return out.reshape(bsz, q_len, -1)
+
+
+
+@torch.library.register_fake("internvl::vision_attention")
+def vision_attention_fake(
+
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        num_heads:int,
+        head_size:int,
+        num_kv_heads:int,
+        num_queries_per_kv:int,
+        scale:float,
+        use_upstream_fa:bool,
+
+) -> torch.Tensor:
+    return torch.empty(
+        query.size(0),
+        query.size(1),
+        query.size(-1),
+        dtype=query.dtype,
+        device=query.device
+    )
+
+
 
 
 class InternMLP(nn.Module):
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        use_data_parallel: bool = False,
+            self,
+            vllm_config:VllmConfig,
+            config: PretrainedConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
+            use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
@@ -254,17 +348,17 @@ class InternMLP(nn.Module):
 
         return hidden_states
 
-
 class InternVisionEncoderLayer(nn.Module):
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        *,
-        num_dummy_heads: int = 0,
-        prefix: str = "",
-        use_data_parallel: bool = False,
+            self,
+            vllm_config: VllmConfig ,
+            config: PretrainedConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            *,
+            num_dummy_heads: int = 0,
+            prefix: str = "",
+            use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
@@ -272,16 +366,19 @@ class InternVisionEncoderLayer(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.norm_type = config.norm_type
 
-        self.attn = self._init_attn(config,
-                                    quant_config,
-                                    num_dummy_heads=num_dummy_heads,
-                                    prefix=f"{prefix}.attn",
-                                    use_data_parallel=use_data_parallel)
+        self.attn = self._init_attn(      vllm_config=vllm_config,
+                                          config=config,
+                                          quant_config=quant_config,
+                                          num_dummy_heads=num_dummy_heads,
+                                          prefix=f"{prefix}.attn",
+                                          use_data_parallel=use_data_parallel)
 
-        self.mlp = InternMLP(config,
-                             quant_config=quant_config,
-                             prefix=f"{prefix}.mlp",
-                             use_data_parallel=use_data_parallel)
+        self.mlp = InternMLP(
+            vllm_config=vllm_config,
+            config=config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+            use_data_parallel=use_data_parallel)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim,
                                              eps=config.layer_norm_eps)
         self.norm2 = NORM2FN[self.norm_type](self.embed_dim,
@@ -293,13 +390,14 @@ class InternVisionEncoderLayer(nn.Module):
                                 torch.ones(self.embed_dim))
 
     def _init_attn(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig],
-        *,
-        num_dummy_heads: int,
-        prefix: str = "",
-        use_data_parallel: bool = False,
+            self,
+            vllm_config: VllmConfig ,
+            config: PretrainedConfig,
+            quant_config: Optional[QuantizationConfig],
+            *,
+            num_dummy_heads: int,
+            prefix: str = "",
+            use_data_parallel: bool = False,
     ):
         # fallback to sdpa attention if tp unavailable
         tp_size = (1 if use_data_parallel else
@@ -310,15 +408,17 @@ class InternVisionEncoderLayer(nn.Module):
         # we also disable Attention's TP
         use_data_parallel = (use_data_parallel
                              or (num_heads + num_dummy_heads) % tp_size != 0)
-        return InternParallelAttention(config,
-                                       quant_config=quant_config,
-                                       num_dummy_heads=num_dummy_heads,
-                                       prefix=prefix,
-                                       use_data_parallel=use_data_parallel)
+        return InternParallelAttention(
+            vllm_config=vllm_config,
+            config=config,
+            quant_config=quant_config,
+            num_dummy_heads=num_dummy_heads,
+            prefix=prefix,
+            use_data_parallel=use_data_parallel)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
+            self,
+            hidden_states: torch.Tensor,
     ):
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states)) * self.ls1
@@ -332,14 +432,15 @@ class InternVisionEncoderLayer(nn.Module):
 class InternVisionEncoder(nn.Module):
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        *,
-        num_hidden_layers_override: Optional[int] = None,
-        num_dummy_heads: int = 0,
-        prefix: str = "",
-        use_data_parallel: bool = False,
+            self,
+            vllm_config: VllmConfig ,
+            config: PretrainedConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            *,
+            num_hidden_layers_override: Optional[int] = None,
+            num_dummy_heads: int = 0,
+            prefix: str = "",
+            use_data_parallel: bool = False,
     ):
         super().__init__()
 
@@ -351,11 +452,13 @@ class InternVisionEncoder(nn.Module):
             num_hidden_layers = num_hidden_layers_override
 
         self.layers = nn.ModuleList([
-            InternVisionEncoderLayer(config,
-                                     quant_config,
-                                     num_dummy_heads=num_dummy_heads,
-                                     prefix=f"{prefix}.layers.{layer_idx}",
-                                     use_data_parallel=use_data_parallel)
+            InternVisionEncoderLayer(
+                vllm_config=vllm_config,
+                config=config,
+                quant_config=quant_config,
+                num_dummy_heads=num_dummy_heads,
+                prefix=f"{prefix}.layers.{layer_idx}",
+                use_data_parallel=use_data_parallel)
             for layer_idx in range(num_hidden_layers)
         ])
 
@@ -368,6 +471,8 @@ class InternVisionEncoder(nn.Module):
         return hidden_states
 
 
+@set_model_tag("InternVisionModel")
+@support_torch_compile
 class InternVisionModel(nn.Module):
 
     packed_modules_mapping = {
@@ -375,22 +480,24 @@ class InternVisionModel(nn.Module):
     }
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        *,
-        num_hidden_layers_override: Optional[int] = None,
-        num_dummy_heads: int = 0,
-        prefix: str = "",
-        use_data_parallel: bool = False,
+            self,
+            vllm_config: VllmConfig ,
+            config: PretrainedConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            *,
+            num_hidden_layers_override: Optional[int] = None,
+            num_dummy_heads: int = 0,
+            prefix: str = "",
+            use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
         self.config = config
         self.use_data_parallel = use_data_parallel
 
-        self.embeddings = InternVisionEmbeddings(config)
+        self.embeddings = InternVisionEmbeddings(prefix=f"{prefix}.embeddings_",vllm_config=vllm_config,config=config)
         self.encoder = InternVisionEncoder(
+            vllm_config=vllm_config,
             config=config,
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers_override,
@@ -403,9 +510,9 @@ class InternVisionModel(nn.Module):
         return self.embeddings
 
     def forward(
-        self,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_embeds: Optional[torch.Tensor] = None,
+            self,
+            pixel_values: Optional[torch.Tensor] = None,
+            pixel_embeds: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         if pixel_values is None and pixel_embeds is None:
             raise ValueError(
@@ -429,7 +536,7 @@ class InternVisionModel(nn.Module):
         return encoder_outputs
 
     def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
